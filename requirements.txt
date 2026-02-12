@@ -1,0 +1,8 @@
+onnxruntime-gpu
+torch
+torchvision
+torchaudio
+ultralytics
+opencv-python
+numpy
+requests
