@@ -26,6 +26,9 @@ EMOTION_EVERY_N_FRAMES = 6         # emotion ~5 times/sec at 30fps
 # Smoothing (reduces jitter)
 SMOOTHING_ALPHA = 0.35             # higher = more responsive, lower = smoother
 
+#Torch
+torch.backends.cudnn.benchmark = True
+
 # ----------------------------
 # Helpers
 # ----------------------------
