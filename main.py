@@ -12,29 +12,31 @@ from emotion_ferplus import FerPlusOnnx, EMOTION_LABELS
 FACE_MODEL_PATH = "yolov8n-face-lindevs.pt"
 EMO_MODEL_PATH = "emotion-ferplus-8.onnx"
 
+LLM_MODE = "groq"  # "auto" = gemini -> groq -> local | "gemini" | "groq" | "local"
+
 CAM_INDEX = 0
-FRAME_W, FRAME_H = 640, 480      # resoultion
+FRAME_W, FRAME_H = 640, 480      # camera window resolution
 TARGET_FPS = 30
 
 FACE_CONF = 0.50
 CROP_MARGIN = 0.15
 
-# Performance knobs
-DETECT_EVERY_N_FRAMES = 1          # set to 2 or 3 if you want more FPS
-EMOTION_EVERY_N_FRAMES = 6         # emotion ~5 times/sec at 30fps
+# Video performance knobs
+DETECT_EVERY_N_FRAMES = 1          # face detection every frame
+EMOTION_EVERY_N_FRAMES = 6         # emotion detection every 6 frames
 
-# Smoothing (reduces jitter)
+# Video smoothing (reduces jitter)
 SMOOTHING_ALPHA = 0.35             # higher = more responsive, lower = smoother
 
-#Torch
-torch.backends.cudnn.benchmark = True
+# ----------------------------
+# Helper Functions
+# ----------------------------
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# Clamp a value v into the inclusive range [lo, hi] (prevents box coords going out of frame bounds).
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
+# Draw a readable text label with a black background box at image position (x, y).
 def put_label(img, text, x, y):
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.7
@@ -43,10 +45,12 @@ def put_label(img, text, x, y):
     cv2.rectangle(img, (x, y - th - baseline - 8), (x + tw + 10, y + 4), (0, 0, 0), -1)
     cv2.putText(img, text, (x + 5, y - 5), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
+# From multiple detected face boxes, select the index of the box with the largest area (assumes one main face).
 def pick_largest_box(xyxy: np.ndarray):
     areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
     return int(np.argmax(areas))
 
+# Expand a bounding box by a margin percentage and clamp it to the image boundaries.
 def expand_box(box, w, h, margin=0.15):
     x1, y1, x2, y2 = box
     bw = x2 - x1
@@ -62,6 +66,8 @@ def expand_box(box, w, h, margin=0.15):
 # ----------------------------
 # Main
 # ----------------------------
+
+# Capture frames from the webcam, run face detection + emotion recognition, and display results (plus AI response panel).
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[INFO] Torch device: {device}")
@@ -70,15 +76,19 @@ def main():
     face_model = YOLO(FACE_MODEL_PATH)
     emo_model = FerPlusOnnx(EMO_MODEL_PATH, use_gpu=True)
 
+    # 30fps but very slow to open the camera
     # cap = cv2.VideoCapture(CAM_INDEX)
-    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_MSMF)
+
+    # Very fast to open the camera but 15fps
+    # cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
     cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    panel = EmotionAIPanel(config_path="api_keys.json", width=520, height=480)
+    panel = EmotionAIPanel(config_path="api_keys.json", width=520, height=480, llm_mode=LLM_MODE)
     panel.setup()
 
     # Move windows so they sit next to each other
@@ -142,8 +152,11 @@ def main():
 
                 li = int(np.argmax(smoothed_probs))
                 last_label = EMOTION_LABELS[li]
+
+                # Feed current dominant emotion label to the AI panel's 5-second collector
                 if last_face_box is not None:
                     panel.update_emotion_sample(last_label)
+
                 last_conf = float(smoothed_probs[li])
 
             # Draw overlay
@@ -162,14 +175,17 @@ def main():
         put_label(frame, f"FPS: {fps:.1f} | det:{DETECT_EVERY_N_FRAMES} emo:{EMOTION_EVERY_N_FRAMES}", 10, 30)
         cv2.imshow("Face + Emotion (YOLOv8-Face + FER+)", frame)
 
+        # Draw + show the AI response panel window
         panel_img = panel.draw_panel()
         cv2.imshow(panel.window_name, panel_img)
+
         key = cv2.waitKey(1) & 0xFF
         if key == 27 or key == ord("q"):
             break
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

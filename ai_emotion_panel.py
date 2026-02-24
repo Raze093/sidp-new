@@ -10,22 +10,34 @@ import requests
 
 
 # ----------------------------
-# Pre-coded fallback responses
+# Pre-coded fallback/local responses
 # ----------------------------
 FALLBACK_RESPONSES = {
-    "neutral": "You look neutral. If you're focusing, that's great. Want a quick goal for the next 5 minutes?",
-    "happiness": "You look happy—nice! Keep that momentum. What’s one small win you can do next?",
+    "neutral": "You look neutral. If you're focusing, that is great. Want a quick goal for the next 5 minutes?",
+    "happiness": "You look happy, nice! Keep that momentum. What is one small win you can do next?",
     "surprise": "You look surprised. Did something unexpected happen? Take a breath and decide your next step calmly.",
     "sadness": "You look sad. It might help to pause for a moment. Try 3 slow breaths and do one small, easy task.",
     "anger": "You look tense/angry. Try unclenching your jaw and shoulders. A short break can reset your focus.",
-    "disgust": "You look uncomfortable. If something’s bothering you, step back, reassess, and simplify the next action.",
-    "fear": "You look anxious. Try grounding: name 3 things you see, 2 you feel, 1 you hear—then pick one tiny next step.",
+    "disgust": "You look uncomfortable. If something is bothering you, step back, reassess, and simplify the next action.",
+    "fear": "You look anxious. Try grounding: name 3 things you see, 2 you feel, 1 you hear, then pick one tiny next step.",
     "contempt": "You look skeptical/annoyed. If something feels inefficient, define the problem in one sentence and adjust.",
 }
 
 # If emotion label is unknown for any reason:
-DEFAULT_FALLBACK = "I couldn't classify the emotion reliably. If you want, tell me what you're feeling and I’ll respond."
+DEFAULT_FALLBACK = "I couldn't classify the emotion reliably. If you want, tell me what you're feeling and I will respond."
 
+PROMPT_TEMPLATES = {
+    "gemini": (
+        "You are a kindergarten teacher analyzing a live child's webcam feed. You are addressing the child directly."
+        "Dominant facial emotion over the last 5 seconds: {emotion} (samples={samples}). "
+        "Give a short, sweet response for the child. Text only, under 70 words."
+    ),
+    "groq": (
+        "You are a kindergarten teacher analyzing a live child's webcam feed. You are addressing the child directly."
+        "Dominant facial emotion over the last 5 seconds: {emotion} (samples={samples}). "
+        "Reply with a short, sweet response for the child in under 70 words, no emojis. Text only."
+    ),
+}
 
 # ----------------------------
 # Config
@@ -34,8 +46,8 @@ DEFAULT_FALLBACK = "I couldn't classify the emotion reliably. If you want, tell 
 class AIConfig:
     gemini_api_key: str = ""
     groq_api_key: str = ""
-    gemini_model: str = "gemini-1.5-flash-001"
-    groq_model: str = "llama-3.3-70b-versatile"
+    gemini_model: str = "gemini-2.5-flash-lite"
+    groq_model: str = "llama-3.1-8b-instant"
 
 
 def load_config(path: str) -> AIConfig:
@@ -44,8 +56,8 @@ def load_config(path: str) -> AIConfig:
     return AIConfig(
         gemini_api_key=data.get("gemini_api_key", ""),
         groq_api_key=data.get("groq_api_key", ""),
-        gemini_model=data.get("gemini_model", "gemini-1.5-flash-001"),
-        groq_model=data.get("groq_model", "llama-3.3-70b-versatile"),
+        gemini_model=data.get("gemini_model", "gemini-2.5-flash-lite"),
+        groq_model=data.get("groq_model", "llama-3.1-8b-instant"),
     )
 
 
@@ -167,6 +179,9 @@ class GroqClient:
 @dataclass
 class EmotionAIPanel:
     config_path: str = "api_keys.json"
+    llm_mode: str = "auto"  # "auto" | "gemini" | "groq" | "local"
+    _request_start_ts: float = field(default=0.0, init=False)
+    last_latency_s: float = 0.0
     window_name: str = "AI Coach"
     width: int = 520
     height: int = 480
@@ -230,6 +245,7 @@ class EmotionAIPanel:
         self.last_ai_text = "Thinking..."
         self.last_source = "calling"
         self.last_error = ""
+        self._request_start_ts = time.time()
 
         t = threading.Thread(
             target=self._ai_worker,
@@ -239,39 +255,80 @@ class EmotionAIPanel:
         t.start()
 
     def _ai_worker(self, dominant_emotion: str, total_samples: int):
-        prompt = (
-            "You are a kindergarten teacher analyzing a live webcam feed. "
-            f"The dominant facial emotion over the last 5 seconds is: {dominant_emotion} "
-            f"(samples={total_samples}). "
-            "Give a short supportive suggestion for the child. Make it short, concise and sweet. "
-            "Text only, one sentence, must be under 50 words."
-        )
+        mode = (self.llm_mode or "auto").strip().lower()
 
-        # 1) Try Gemini
-        ok, text, status, raw = self._gemini.generate(prompt, timeout_s=10.0) if self._gemini else (False, "Gemini not configured.", None, None)
+        def make_prompt(which: str) -> str:
+            tpl = PROMPT_TEMPLATES.get(which, PROMPT_TEMPLATES["gemini"])
+            return tpl.format(emotion=dominant_emotion, samples=total_samples)
+
+        def use_local(gemini_err: str = "", groq_err: str = ""):
+            fallback = FALLBACK_RESPONSES.get(dominant_emotion, DEFAULT_FALLBACK)
+            err_parts = []
+            if gemini_err:
+                err_parts.append(f"Gemini failed: {gemini_err}")
+            if groq_err:
+                err_parts.append(f"Groq failed: {groq_err}")
+            self._set_result(fallback, source="local", error=" | ".join(err_parts))
+
+        # -------- Mode: local only --------
+        if mode == "local":
+            use_local()
+            return
+
+        # -------- Mode: gemini only (else local) --------
+        if mode == "gemini":
+            prompt = make_prompt("gemini")
+            ok, text, status, raw = self._gemini.generate(prompt, timeout_s=10.0) if self._gemini else (False, "Gemini not configured.", None, None)
+            if ok:
+                self._set_result(text, source="gemini")
+            else:
+                use_local(gemini_err=text)
+            return
+
+        # -------- Mode: groq only (else local) --------
+        if mode == "groq":
+            prompt = make_prompt("groq")
+            ok, text, status, raw = self._groq.chat(prompt, timeout_s=10.0) if self._groq else (False, "Groq not configured.", None, None)
+            if ok:
+                self._set_result(text, source="groq")
+            else:
+                use_local(groq_err=text)
+            return
+
+        # -------- Mode: auto (gemini -> groq -> local) --------
+        prompt_g = make_prompt("gemini")
+        ok, text, status, raw = self._gemini.generate(prompt_g, timeout_s=10.0) if self._gemini else (False, "Gemini not configured.", None, None)
         if ok:
             self._set_result(text, source="gemini")
             return
 
-        # Gemini failed: decide whether to fall back (quota or other error)
         gemini_err = text
-        gemini_quota = (status == 429) or ("RESOURCE_EXHAUSTED" in (raw or "")) or ("resource_exhausted" in (raw or "").lower())
-        # if quota OR any error, fall back to Groq (as you requested)
-        ok2, text2, status2, raw2 = self._groq.chat(prompt, timeout_s=10.0) if self._groq else (False, "Groq not configured.", None, None)
+
+        prompt_r = make_prompt("groq")
+        ok2, text2, status2, raw2 = self._groq.chat(prompt_r, timeout_s=10.0) if self._groq else (False, "Groq not configured.", None, None)
         if ok2:
             self._set_result(text2, source="groq", error=f"Gemini failed: {gemini_err}")
             return
 
-        # 3) Final fallback: pre-coded
-        fallback = FALLBACK_RESPONSES.get(dominant_emotion, DEFAULT_FALLBACK)
-        err_msg = f"Gemini failed: {gemini_err} | Groq failed: {text2}"
-        self._set_result(fallback, source="local", error=err_msg)
+        use_local(gemini_err=gemini_err, groq_err=text2)
 
     def _set_result(self, text: str, source: str, error: str = ""):
         with self._lock:
-            self.last_ai_text = text.strip()
+            self.last_ai_text = (text or "").strip()
             self.last_source = source
-            self.last_error = error.strip()
+            self.last_error = (error or "").strip()
+
+            # latency from trigger -> final response
+            if self._request_start_ts > 0:
+                self.last_latency_s = time.time() - self._request_start_ts
+            else:
+                self.last_latency_s = 0.0
+
+            # Print latency ONLY when final result came from a cloud LLM
+            mode = (self.llm_mode or "auto").strip().lower()
+            if source in ("gemini", "groq") and mode in ("auto", "gemini", "groq"):
+                print(f"[LATENCY] {source.upper()} response in {self.last_latency_s:.3f}s (mode={mode}, emotion={self.last_emotion})")
+
             self._inflight = False
 
     def draw_panel(self) -> np.ndarray:
